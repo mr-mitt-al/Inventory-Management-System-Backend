@@ -1,0 +1,46 @@
+# Line endings.
+#
+# This matters more than it looks. Windows git is commonly configured with
+# core.autocrlf=true, which rewrites LF to CRLF on checkout. A shell script with
+# CRLF line endings copied into a Linux container fails at the shebang with:
+#
+#     /usr/bin/env: 'bash\r': No such file or directory
+#
+# which is a genuinely baffling error to debug. Anything that will be executed
+# inside a container is pinned to LF regardless of the developer's platform.
+
+* text=auto eol=lf
+
+# Executed inside Linux containers - must be LF.
+*.sh            text eol=lf
+Makefile        text eol=lf
+Dockerfile      text eol=lf
+*.Dockerfile    text eol=lf
+entrypoint.sh   text eol=lf
+
+# Python, config and SQL: LF everywhere for consistent diffs.
+*.py            text eol=lf
+*.pyi           text eol=lf
+*.sql           text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+*.toml          text eol=lf
+*.ini           text eol=lf
+*.cfg           text eol=lf
+*.mako          text eol=lf
+*.json          text eol=lf
+*.md            text eol=lf
+*.txt           text eol=lf
+.env.example    text eol=lf
+.gitignore      text eol=lf
+
+# PowerShell is Windows-native; CRLF is correct there.
+*.ps1           text eol=crlf
+
+# Never touched.
+*.png           binary
+*.jpg           binary
+*.jpeg          binary
+*.gif           binary
+*.ico           binary
+*.pdf           binary

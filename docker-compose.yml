@@ -1,0 +1,432 @@
+name: ecommerce-order-processing
+
+x-service-base: &service-base
+  restart: unless-stopped
+  depends_on:
+    postgres:
+      condition: service_healthy
+    kafka:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
+x-common-env: &common-env
+  ENV: ${ENV:-development}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  REDIS_URL: redis://redis:6379/0
+  JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
+  JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
+  ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-15}
+  REFRESH_TOKEN_EXPIRE_DAYS: ${REFRESH_TOKEN_EXPIRE_DAYS:-7}
+  CONSUMER_MAX_RETRIES: ${CONSUMER_MAX_RETRIES:-3}
+  CONSUMER_RETRY_BACKOFF_MS: ${CONSUMER_RETRY_BACKOFF_MS:-1000}
+  OUTBOX_POLL_INTERVAL_MS: ${OUTBOX_POLL_INTERVAL_MS:-500}
+
+services:
+  # ------------------------------------------------------------------ infra
+  postgres:
+    image: postgres:16-alpine
+    container_name: eop-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-app}
+      POSTGRES_DB: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infra/postgres/init-databases.sql:/docker-entrypoint-initdb.d/00-init-databases.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-app} -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  redis:
+    image: redis:7-alpine
+    container_name: eop-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: eop-kafka
+    ports:
+      - "29092:29092"
+    environment:
+      # --- KRaft: no Zookeeper ---
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,EXTERNAL://0.0.0.0:29092
+      # PLAINTEXT = in-network (services). EXTERNAL = from your host machine.
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Topics are created explicitly by kafka-init so partition counts are intentional.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+      start_period: 20s
+
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: eop-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    volumes:
+      - ./infra/kafka/create-topics.sh:/create-topics.sh:ro
+    entrypoint: ["bash", "/create-topics.sh"]
+    environment:
+      BOOTSTRAP: kafka:9092
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: eop-kafka-ui
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      DYNAMIC_CONFIG_ENABLED: "true"
+
+  # ------------------------------------------------------------------ auth
+  auth-api:
+    <<: *service-base
+    build:
+      context: .
+      dockerfile: services/auth/Dockerfile
+    container_name: eop-auth-api
+    ports:
+      - "8001:8000"
+    environment:
+      <<: *common-env
+      SERVICE_NAME: auth-service
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@postgres:5432/auth_db
+      BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-}
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-}
+      BOOTSTRAP_ADMIN_NAME: ${BOOTSTRAP_ADMIN_NAME:-Bootstrap Admin}
+      LOGIN_MAX_ATTEMPTS: ${LOGIN_MAX_ATTEMPTS:-5}
+      LOGIN_ATTEMPT_WINDOW_SECONDS: ${LOGIN_ATTEMPT_WINDOW_SECONDS:-900}
+      RUN_MIGRATIONS: "true"
+    command: ["api"]
+
+  auth-outbox:
+    <<: *service-base
+    build:
+      context: .
+      dockerfile: services/auth/Dockerfile
+    container_name: eop-auth-outbox
+    environment:
+      <<: *common-env
+      SERVICE_NAME: auth-outbox
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@postgres:5432/auth_db
+      RUN_MIGRATIONS: "false"
+    command: ["outbox"]
+
+  # --------------------------------------------------------------- catalog
+  catalog-api:
+    <<: *service-base
+    build:
+      context: .
+      dockerfile: services/catalog/Dockerfile
+    container_name: eop-catalog-api
+    ports:
+      - "8002:8000"
+    environment:
+      <<: *common-env
+      SERVICE_NAME: catalog-service
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@postgres:5432/catalog_db
+      PRODUCT_CACHE_TTL_SECONDS: ${PRODUCT_CACHE_TTL_SECONDS:-300}
+      LISTING_CACHE_TTL_SECONDS: ${LISTING_CACHE_TTL_SECONDS:-60}
+      RUN_MIGRATIONS: "true"
+    command: ["api"]
+
+  catalog-consumer:
+    <<: *service-base
+    build:
+      context: .
+      dockerfile: services/catalog/Dockerfile
+    container_name: eop-catalog-consumer
+    environment:
+      <<: *common-env
+      SERVICE_NAME: catalog-consumer
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@postgres:5432/catalog_db
+      RUN_MIGRATIONS: "false"
+    command: ["consumer"]
+
+  catalog-outbox:
+    <<: *service-base
+    build:
+      context: .
+      dockerfile: services/catalog/Dockerfile
+    container_name: eop-catalog-outbox
+    environment:
+      <<: *common-env
+      SERVICE_NAME: catalog-outbox
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@postgres:5432/catalog_db
+      RUN_MIGRATIONS: "false"
+    command: ["outbox"]
+
+  # ------------------------------------------------------------- inventory
+  # Source of truth for stock. Four processes from one image.
+  inventory-api:
+    <<: *service-base
+    build:
+      context: .
+      dockerfile: services/inventory/Dockerfile
+    container_name: eop-inventory-api
+    ports:
+      - "8004:8000"
+    environment:
+      <<: *common-env
+      SERVICE_NAME: inventory-service
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@postgres:5432/inventory_db
+      RESERVATION_TTL_MINUTES: ${RESERVATION_TTL_MINUTES:-15}
+      SWEEPER_INTERVAL_SECONDS: ${SWEEPER_INTERVAL_SECONDS:-60}
+      RUN_MIGRATIONS: "true"
+    command: ["api"]
+
+  inventory-consumer:
+    <<: *service-base
+    build:
+      context: .
+      dockerfile: services/inventory/Dockerfile
+    container_name: eop-inventory-consumer
+    environment:
+      <<: *common-env
+      SERVICE_NAME: inventory-consumer
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@postgres:5432/inventory_db
+      RESERVATION_TTL_MINUTES: ${RESERVATION_TTL_MINUTES:-15}
+      RUN_MIGRATIONS: "false"
+    command: ["consumer"]
+
+  inventory-outbox:
+    <<: *service-base
+    build:
+      context: .
+      dockerfile: services/inventory/Dockerfile
+    container_name: eop-inventory-outbox
+    environment:
+      <<: *common-env
+      SERVICE_NAME: inventory-outbox
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@postgres:5432/inventory_db
+      RUN_MIGRATIONS: "false"
+    command: ["outbox"]
+
+  # Reclaims stock from reservations whose TTL passed. Without this, a service
+  # that dies mid-saga strands stock permanently.
+  inventory-sweeper:
+    <<: *service-base
+    build:
+      context: .
+      dockerfile: services/inventory/Dockerfile
+    container_name: eop-inventory-sweeper
+    environment:
+      <<: *common-env
+      SERVICE_NAME: inventory-sweeper
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@postgres:5432/inventory_db
+      RESERVATION_TTL_MINUTES: ${RESERVATION_TTL_MINUTES:-15}
+      SWEEPER_INTERVAL_SECONDS: ${SWEEPER_INTERVAL_SECONDS:-60}
+      RUN_MIGRATIONS: "false"
+    command: ["sweeper"]
+
+  # ----------------------------------------------------------------- order
+  # The saga orchestrator.
+  order-api:
+    <<: *service-base
+    build:
+      context: .
+      dockerfile: services/order/Dockerfile
+    container_name: eop-order-api
+    ports:
+      - "8003:8000"
+    environment:
+      <<: *common-env
+      SERVICE_NAME: order-service
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@postgres:5432/order_db
+      RUN_MIGRATIONS: "true"
+    command: ["api"]
+
+  order-consumer:
+    <<: *service-base
+    build:
+      context: .
+      dockerfile: services/order/Dockerfile
+    container_name: eop-order-consumer
+    environment:
+      <<: *common-env
+      SERVICE_NAME: order-consumer
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@postgres:5432/order_db
+      RUN_MIGRATIONS: "false"
+    command: ["consumer"]
+
+  order-outbox:
+    <<: *service-base
+    build:
+      context: .
+      dockerfile: services/order/Dockerfile
+    container_name: eop-order-outbox
+    environment:
+      <<: *common-env
+      SERVICE_NAME: order-outbox
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@postgres:5432/order_db
+      RUN_MIGRATIONS: "false"
+    command: ["outbox"]
+
+  # Collects every *.DLQ topic into order_db so the admin DLQ screen can list and
+  # replay parked messages.
+  order-dlq:
+    <<: *service-base
+    build:
+      context: .
+      dockerfile: services/order/Dockerfile
+    container_name: eop-order-dlq
+    environment:
+      <<: *common-env
+      SERVICE_NAME: order-dlq-consumer
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@postgres:5432/order_db
+      RUN_MIGRATIONS: "false"
+    command: ["dlq"]
+
+  # --------------------------------------------------------------- payment
+  payment-api:
+    <<: *service-base
+    build:
+      context: .
+      dockerfile: services/payment/Dockerfile
+    container_name: eop-payment-api
+    ports:
+      - "8005:8000"
+    environment:
+      <<: *common-env
+      SERVICE_NAME: payment-service
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@postgres:5432/payment_db
+      MOCK_FAILURE_RATE: ${MOCK_FAILURE_RATE:-0.0}
+      MOCK_LATENCY_MS: ${MOCK_LATENCY_MS:-500}
+      RUN_MIGRATIONS: "true"
+    command: ["api"]
+
+  payment-consumer:
+    <<: *service-base
+    build:
+      context: .
+      dockerfile: services/payment/Dockerfile
+    container_name: eop-payment-consumer
+    environment:
+      <<: *common-env
+      SERVICE_NAME: payment-consumer
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@postgres:5432/payment_db
+      MOCK_FAILURE_RATE: ${MOCK_FAILURE_RATE:-0.0}
+      MOCK_LATENCY_MS: ${MOCK_LATENCY_MS:-500}
+      RUN_MIGRATIONS: "false"
+    command: ["consumer"]
+
+  payment-outbox:
+    <<: *service-base
+    build:
+      context: .
+      dockerfile: services/payment/Dockerfile
+    container_name: eop-payment-outbox
+    environment:
+      <<: *common-env
+      SERVICE_NAME: payment-outbox
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@postgres:5432/payment_db
+      RUN_MIGRATIONS: "false"
+    command: ["outbox"]
+
+  # ---------------------------------------------------------- notification
+  # Consumer only - no HTTP API, no ingress. No other service knows it exists.
+  notification-consumer:
+    <<: *service-base
+    build:
+      context: .
+      dockerfile: services/notification/Dockerfile
+    container_name: eop-notification-consumer
+    environment:
+      <<: *common-env
+      SERVICE_NAME: notification-service
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@postgres:5432/notification_db
+      ADMIN_ALERT_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-admin@example.com}
+      RUN_MIGRATIONS: "true"
+    command: ["consumer"]
+
+  # --------------------------------------------------------------- gateway
+  gateway:
+    build:
+      context: .
+      dockerfile: services/gateway/Dockerfile
+    container_name: eop-gateway
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+      auth-api:
+        condition: service_started
+      catalog-api:
+        condition: service_started
+      order-api:
+        condition: service_started
+      inventory-api:
+        condition: service_started
+      payment-api:
+        condition: service_started
+    environment:
+      <<: *common-env
+      SERVICE_NAME: api-gateway
+      AUTH_URL: http://auth-api:8000
+      CATALOG_URL: http://catalog-api:8000
+      ORDER_URL: http://order-api:8000
+      INVENTORY_URL: http://inventory-api:8000
+      PAYMENT_URL: http://payment-api:8000
+      RATE_LIMIT_REQUESTS: ${RATE_LIMIT_REQUESTS:-120}
+      WRITE_RATE_LIMIT_REQUESTS: ${WRITE_RATE_LIMIT_REQUESTS:-30}
+
+  # -------------------------------------------------------------- frontend
+  # Built and served by nginx, which also proxies /api -> gateway so the browser
+  # stays on a single origin. Context reaches outside this directory because the
+  # frontend is a sibling folder.
+  frontend:
+    build:
+      context: ../E-Commerce Frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: /api
+    container_name: eop-frontend
+    restart: unless-stopped
+    ports:
+      - "5173:80"
+    depends_on:
+      gateway:
+        condition: service_started
+
+volumes:
+  postgres-data:
+  redis-data:
+  kafka-data:

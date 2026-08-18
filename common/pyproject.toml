@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "eop-common"
+version = "0.1.0"
+description = "Shared building blocks for the e-commerce order processing services"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115.0",
+    "pydantic>=2.9.0",
+    "pydantic-settings>=2.5.0",
+    "sqlalchemy[asyncio]>=2.0.35",
+    "asyncpg>=0.29.0",
+    "aiokafka>=0.11.0",
+    "redis>=5.1.0",
+    "pyjwt>=2.9.0",
+    "prometheus-client>=0.21.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["common*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
